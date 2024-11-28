@@ -127,6 +127,7 @@ impl<'a> RpcError<'a> {
 
 /// Type for errors returned by the RPC server
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RpcServerError {
     /// Buffer overflow error, e.g. message too large
     BufferOverflow,
