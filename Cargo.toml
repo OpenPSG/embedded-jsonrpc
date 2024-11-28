@@ -1,10 +1,9 @@
 [package]
 name = "embedded-jsonrpc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MPL-2.0"
-license-file = "LICENSE"
-description = "A simple JSON-RPC 2.0 server implementation for embedded systems."
+description = "A JSON-RPC 2.0 server implementation for embedded systems."
 
 [dependencies]
 defmt = { version = "0.3", optional = true }

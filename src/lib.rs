@@ -1,48 +1,30 @@
 //! # JSON-RPC for Embedded Systems
 //!
-//! This crate provides a simple JSON-RPC server implementation for embedded systems.
+//! This crate provides a JSON-RPC server implementation for embedded systems.
 //!
 //! ## Features
 //!
-//! - **no_std Support**: Compatible with `#![no_std]` environments.
-//! - **Zero Alloc**: Uses statically allocated buffers and `heapless` containers for predictable memory usage.
-//! - **Async**: Non-blocking IO with `embedded-io-async`.
-//! - **Varint Framing**: Efficient message framing and length-prefix encoding using protobuf style varints.
-//! - **Error Handling**: Includes comprehensive error codes and descriptions based on the JSON-RPC specification.
-//!
-//! ## Core Components
-//!
-//! ### JSON-RPC Data Structures
-//!
-//! - **`RpcRequest`**: Represents a JSON-RPC request, including the method and optional parameters.
-//! - **`RpcResponse`**: Represents a JSON-RPC response, including the result or error information.
-//! - **`RpcError` and `RpcErrorCode`**: Encapsulate errors with standard codes and descriptions.
-//!
-//! ### RPC Server
-//!
-//! - **`RpcServer`**: Core server to manage method registration and handle incoming requests.
-//! - **Handlers**: Define functions for specific RPC methods using a type-safe `RpcHandler`.
-//! - **`serve`**: Processes incoming requests and sends responses over an `embedded-io-async` stream.
+//! - **`#![no_std]` Support**: Fully compatible with environments lacking a standard library.
+//! - **Predictable Memory Usage**: Zero dynamic allocation with statically sized buffers.
+//! - **Async**: Non-blocking I/O with `embedded-io-async`.
+//! - **Client Compatibility**: Uses LSP style framing for JSON-RPC messages.
+//! - **Error Handling**: Adheres to JSON-RPC standards with robust error reporting.
 //!
 //! ## Example Usage
 //!
 //! ### Create an RPC Server
 //!
 //! ```rust
-//! use embedded_jsonrpc::{RpcServer, RpcResponse, RpcError, RpcErrorCode, JSONRPC_VERSION};
+//! use embedded_jsonrpc::{RpcServer, RpcResponse, JSONRPC_VERSION};
 //!
-//! const MAX_CLIENTS: usize = 1;
-//! const MAX_HANDLERS: usize = 2;
-//! const MAX_MESSAGE_LEN: usize = 256;
-//!
-//! let mut server: RpcServer<'_, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN> = RpcServer::new();
+//! let mut server: RpcServer<'_> = RpcServer::new();
 //! server.register_method("echo", |id, _request_json, response_json| {
 //!    let response = RpcResponse {
 //!        jsonrpc: JSONRPC_VERSION,
 //!        id,
 //!        error: None,
 //!    };
-//!    serde_json_core::to_slice(&response, response_json).unwrap()
+//!    Ok(serde_json_core::to_slice(&response, response_json).unwrap())
 //! });
 //! ```
 //!
@@ -65,28 +47,22 @@
 //! - [Embedded IO Async](https://docs.rs/embedded-io-async)
 //!
 
-use crate::varint::{decode as varint_decode, encode as varint_encode};
 use embassy_futures::select::{select, Either};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     pubsub::{PubSubChannel, WaitResult},
 };
 use embedded_io_async::{Read, Write};
-use heapless::{FnvIndexMap, Vec};
+use heapless::{FnvIndexMap, Vec, String};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "defmt")]
 use defmt::*;
 
-pub mod varint;
-
 /// JSON-RPC Version
 /// Currently only supports version 2.0
 /// https://www.jsonrpc.org/specification
 pub const JSONRPC_VERSION: &str = "2.0";
-
-/// Maximum number of queued, unsent, notifications.
-const MAX_QUEUED_NOTIFICATIONS: usize = 4;
 
 /// JSON-RPC Request structure
 #[derive(Deserialize, Serialize)]
@@ -149,15 +125,36 @@ impl<'a> RpcError<'a> {
     }
 }
 
+/// Type for errors returned by the RPC server
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum RpcServerError {
+    /// Buffer overflow error, e.g. message too large
+    BufferOverflow,
+    /// IO error, e.g. read/write error
+    IoError,
+    // Parse error, e.g. invalid JSON
+    ParseError,
+}
+
 /// Type for RPC handler functions
-pub type RpcHandler = fn(id: Option<u64>, request_json: &[u8], response_json: &mut [u8]) -> usize;
+pub type RpcHandler = fn(id: Option<u64>, request_json: &[u8], response_json: &mut [u8]) -> Result<usize, RpcError<'static>>;
+
+
+/// Default maximum number of clients.
+const DEFAULT_MAX_CLIENTS: usize = 4;
+/// Maximum number of registered RPC methods.
+const DEFAULT_MAX_HANDLERS: usize = 8;
+/// Maximum length of a JSON-RPC message (including headers).
+const DEFAULT_MAX_MESSAGE_LEN: usize = 512;
+/// Maximum number of queued, unsent, notifications.
+const MAX_QUEUED_NOTIFICATIONS: usize = 4;
 
 /// RPC server
 pub struct RpcServer<
     'a,
-    const MAX_CLIENTS: usize,
-    const MAX_HANDLERS: usize,
-    const MAX_MESSAGE_LEN: usize,
+    const MAX_CLIENTS: usize = DEFAULT_MAX_CLIENTS,
+    const MAX_HANDLERS: usize = DEFAULT_MAX_HANDLERS,
+    const MAX_MESSAGE_LEN: usize = DEFAULT_MAX_MESSAGE_LEN,
 > {
     handlers: FnvIndexMap<&'a str, RpcHandler, MAX_HANDLERS>,
     notifications: PubSubChannel<
@@ -193,8 +190,101 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         self.handlers.insert(name, handler).unwrap();
     }
 
+    /// Broadcast a message to all connected clients.
+    pub async fn notify<T: Write>(&self, notification_json: &[u8]) -> Result<(), RpcServerError> {
+        let mut headers: String<32>  = String::new();
+        core::fmt::write(&mut headers, format_args!("Content-Length: {}\r\n\r\n", notification_json.len())).unwrap();
+        if headers.len() + notification_json.len() > MAX_MESSAGE_LEN {
+            return Err(RpcServerError::BufferOverflow);
+        }
+
+        // Construct the framed message
+        let mut framed_message: heapless::Vec<u8, MAX_MESSAGE_LEN> = heapless::Vec::new();
+
+        // Add header and payload to the message buffer
+        framed_message.extend_from_slice(headers.as_bytes()).unwrap();
+        framed_message.extend_from_slice(notification_json).unwrap();
+
+        // Publish the message to the notification channel
+        let notifications = self.notifications.publisher().unwrap();
+        notifications.publish(framed_message).await;
+
+        Ok(())
+    }
+
+    /// Serve requests using the given stream.
+    pub async fn serve<T: Read + Write>(&self, stream: &mut T) -> Result<(), RpcServerError> {
+        let mut notifications = self.notifications.subscriber().unwrap();
+
+        let mut request_buffer = [0u8; MAX_MESSAGE_LEN];
+        let mut response_json = [0u8; MAX_MESSAGE_LEN];
+        let mut read_offset = 0;
+
+        loop {
+            let result = select(
+                notifications.next_message(),
+                stream.read(&mut request_buffer[read_offset..]),
+            )
+            .await;
+
+            match result {
+                Either::First(WaitResult::Message(notification_json)) => {
+                    stream.write_all(&notification_json).await.map_err(|_| RpcServerError::IoError)?;
+                    stream.flush().await.map_err(|_| RpcServerError::IoError)?;
+                    continue;
+                }
+                Either::First(WaitResult::Lagged(x)) => {
+                    #[cfg(feature = "defmt")]
+                    warn!("Dropped {:?} notifications", x);
+                }
+                Either::Second(Ok(0)) => return Ok(()),
+                Either::Second(Ok(n)) => {
+                    read_offset += n;
+
+                    // Process complete frames from the buffer.
+                    while let Some(headers_len) =
+                        Self::parse_headers(&request_buffer[..read_offset])
+                    {
+                        let content_len: usize =
+                            Self::parse_content_length(&request_buffer[..headers_len])?;
+                        let total_message_len = headers_len + content_len;
+
+                        if read_offset < total_message_len {
+                            // Not enough data for a complete message; wait for more.
+                            break;
+                        }
+
+                        // Process the complete JSON-RPC message.
+                        let request_json = &request_buffer[headers_len..headers_len + content_len];
+                        let response_json_len =
+                            self.handle_request(request_json, &mut response_json);
+
+                        // Construct the response
+                        let mut headers: String<32>  = String::new();
+                        core::fmt::write(&mut headers, format_args!("Content-Length: {}\r\n\r\n", response_json_len)).unwrap();
+
+                        if headers.len() + response_json_len > MAX_MESSAGE_LEN {
+                            return Err(RpcServerError::BufferOverflow);
+                        }
+
+                        // Write the headers and response to the stream
+                        stream.write_all(headers.as_bytes()).await.map_err(|_| RpcServerError::IoError)?;
+                        stream.write_all(&response_json[..response_json_len]).await.map_err(|_| RpcServerError::IoError)?;
+                        stream.flush().await.map_err(|_| RpcServerError::IoError)?;
+
+                        // Remove the processed message from the buffer.
+                        let remaining = read_offset - total_message_len;
+                        request_buffer.copy_within(total_message_len..read_offset, 0);
+                        read_offset = remaining;
+                    }
+                }
+                Either::Second(Err(_)) => return Err(RpcServerError::IoError),
+            }
+        }
+    }
+
     /// Handle a single JSON-RPC request
-    pub fn handle_request(&self, request_json: &[u8], response_json: &mut [u8]) -> usize {
+    fn handle_request(&self, request_json: &[u8], response_json: &mut [u8]) -> usize {
         let request: RpcRequest = match serde_json_core::from_slice::<RpcRequest<'_>>(request_json)
         {
             Ok((request, _remainder)) => request,
@@ -230,7 +320,20 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         }
 
         return match self.handlers.get(request.method) {
-            Some(handler) => handler(id, request_json, response_json),
+            Some(handler) => {
+                match handler(id, request_json, response_json) {
+                    Ok(response_len) => response_len,
+                    Err(e) => {
+                        let response = RpcResponse {
+                            jsonrpc: JSONRPC_VERSION,
+                            error: Some(e),
+                            id,
+                        };
+
+                        serde_json_core::to_slice(&response, &mut response_json[..]).unwrap()
+                    }
+                }
+            }
             None => {
                 let response = RpcResponse {
                     jsonrpc: JSONRPC_VERSION,
@@ -243,89 +346,23 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         };
     }
 
-    /// Broadcast a message to all connected clients.
-    pub async fn notify<T: Write>(&self, notification_json: &[u8]) -> Result<(), T::Error> {
-        let mut notification_json_owned: Vec<u8, MAX_MESSAGE_LEN> = Vec::new();
-
-        notification_json_owned.resize(10, 0).unwrap();
-        let varint_size = varint_encode(notification_json.len(), &mut notification_json_owned);
-        notification_json_owned.truncate(varint_size);
-
-        notification_json_owned
-            .extend_from_slice(notification_json)
-            .unwrap();
-
-        let notifications = self.notifications.publisher().unwrap();
-        notifications.publish(notification_json_owned).await;
-
-        Ok(())
+    /// Parse the headers of the message, returning the index of the end of the headers.
+    fn parse_headers(buffer: &[u8]) -> Option<usize> {
+        return buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|i| i + 4);
     }
 
-    /// Serve requests using the given stream.
-    pub async fn serve<T: Read + Write>(&self, stream: &mut T) -> Result<(), T::Error> {
-        let mut notifications = self.notifications.subscriber().unwrap();
-
-        let mut request_buffer = [0u8; MAX_MESSAGE_LEN];
-        let mut response_json = [0u8; MAX_MESSAGE_LEN];
-        let mut read_offset = 0;
-
-        loop {
-            let result = select(
-                notifications.next_message(),
-                stream.read(&mut request_buffer[read_offset..]),
-            )
-            .await;
-
-            match result {
-                Either::First(WaitResult::Message(notification_json)) => {
-                    stream.write_all(&notification_json).await?;
-                    stream.flush().await?;
-                    continue;
-                }
-                Either::First(WaitResult::Lagged(x)) => {
-                    #[cfg(feature = "defmt")]
-                    warn!("Dropped {:?} notifications", x);
-                }
-                Either::Second(Ok(0)) => return Ok(()),
-                Either::Second(Ok(n)) => {
-                    read_offset += n;
-
-                    // Process complete frames from the buffer
-                    while let Some((message_length, varint_len)) =
-                        varint_decode(&request_buffer[..read_offset])
-                    {
-                        if read_offset < varint_len + message_length {
-                            // Not enough data for a complete message; wait for more
-                            break;
-                        }
-
-                        // Extract the full JSON-RPC message
-                        let request_json = &request_buffer[varint_len..varint_len + message_length];
-
-                        // Handle the request
-                        let response_json_len =
-                            self.handle_request(request_json, &mut response_json);
-
-                        // Frame the response using varint
-                        let mut length_buf = [0u8; 10];
-                        let varint_size = varint_encode(response_json_len, &mut length_buf);
-
-                        // Send the framed response
-                        stream.write_all(&length_buf[..varint_size]).await?;
-                        stream
-                            .write_all(&response_json[..response_json_len])
-                            .await?;
-                        stream.flush().await?;
-
-                        // Remove processed message from the buffer
-                        let remaining = read_offset - (varint_len + message_length);
-                        request_buffer.copy_within(varint_len + message_length..read_offset, 0);
-                        read_offset = remaining;
-                    }
-                }
-                Either::Second(Err(e)) => return Err(e),
+    /// Extract the Content-Length value from headers.
+    fn parse_content_length(buffer: &[u8]) -> Result<usize, RpcServerError> {
+        let headers = core::str::from_utf8(buffer).map_err(|_| RpcServerError::ParseError)?;
+        for line in headers.lines() {
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                return line["content-length:".len()..].trim().parse().map_err(|_| RpcServerError::ParseError);
             }
         }
+        Err(RpcServerError::ParseError)
     }
 }
 
@@ -339,12 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_response() {
-        const MAX_CLIENTS: usize = 1;
-        const MAX_HANDLERS: usize = 2;
-        const MAX_MESSAGE_LEN: usize = 256;
-
-        let mut server: RpcServer<'_, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN> =
-            RpcServer::new();
+        let mut server: RpcServer<'_> = RpcServer::new();
 
         server.register_method("echo", |id, _request_json, response_json| {
             let response = RpcResponse {
@@ -353,7 +385,7 @@ mod tests {
                 error: None,
             };
 
-            serde_json_core::to_slice(&response, response_json).unwrap()
+            Ok(serde_json_core::to_slice(&response, response_json).unwrap())
         });
 
         let (mut stream1, mut stream2) = MemoryPipe::new();
@@ -372,37 +404,25 @@ mod tests {
         let request_len = serde_json_core::to_slice(&request, &mut request_json).unwrap();
 
         // Write the request to the stream
-        let mut length_buf = [0u8; 10];
-        let varint_size = varint_encode(request_len, &mut length_buf);
-        stream1.write_all(&length_buf[..varint_size]).await.unwrap();
-        stream1
-            .write_all(&request_json[..request_len])
-            .await
-            .unwrap();
+        let request_message = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            request_len,
+            core::str::from_utf8(&request_json[..request_len]).unwrap()
+        );
+        stream1.write_all(request_message.as_bytes()).await.unwrap();
+    
+       // Read the response
+       let mut response_buffer = [0u8; DEFAULT_MAX_MESSAGE_LEN];
+       let response_len = stream1.read(&mut response_buffer).await.unwrap();
+   
+       let response = core::str::from_utf8(&response_buffer[..response_len]).unwrap();
 
-        // Read the response from the stream
-        stream1
-            .read_exact(&mut length_buf[..varint_size])
-            .await
-            .unwrap();
-        let response_len = varint_decode(&length_buf[..varint_size]).unwrap().0 as usize;
-        let mut response_json = vec![0u8; response_len];
-        stream1.read_exact(&mut response_json).await.unwrap();
-
-        let (response, _remainder): (RpcResponse, usize) =
-            serde_json_core::from_slice(&response_json).unwrap();
-        assert_eq!(response.jsonrpc, JSONRPC_VERSION);
-        assert_eq!(response.id, Some(1));
-        assert!(response.error.is_none());
+       assert_eq!(response, "Content-Length: 37\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":null}");
     }
 
     #[tokio::test]
     async fn test_notify() {
-        const MAX_CLIENTS: usize = 2;
-        const MAX_HANDLERS: usize = 2;
-        const MAX_MESSAGE_LEN: usize = 256;
-
-        let server = Arc::new(RpcServer::<MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN>::new());
+        let server: Arc<RpcServer<'_>> = Arc::new(RpcServer::new());
 
         let server_clone = Arc::clone(&server); // Clone for use in the spawned task
         let (mut stream1, mut stream2) = MemoryPipe::new();
@@ -422,7 +442,7 @@ mod tests {
             error: None,
         };
 
-        let mut notification_json = [0u8; MAX_MESSAGE_LEN];
+        let mut notification_json = [0u8; DEFAULT_MAX_MESSAGE_LEN];
         let notification_len =
             serde_json_core::to_slice(&notification, &mut notification_json).unwrap();
 
@@ -433,23 +453,11 @@ mod tests {
             .unwrap();
 
         // Read the notification from the stream
-        let mut read_length_buf = [0u8; 1];
-        stream1.read_exact(&mut read_length_buf[..]).await.unwrap();
-        let (received_len, _) = varint_decode(&read_length_buf).unwrap();
+       let mut notification_json = [0u8; DEFAULT_MAX_MESSAGE_LEN];
+       let notification_len = stream1.read(&mut notification_json).await.unwrap();
 
-        assert_eq!(received_len, notification_len);
+       let notification_json = core::str::from_utf8(&notification_json[..notification_len]).unwrap();
 
-        let mut received_notification = vec![0u8; received_len];
-        stream1
-            .read_exact(&mut received_notification)
-            .await
-            .unwrap();
-
-        let (response, _): (RpcResponse, usize) =
-            serde_json_core::from_slice(&received_notification).unwrap();
-
-        assert_eq!(response.jsonrpc, JSONRPC_VERSION);
-        assert_eq!(response.id, None);
-        assert!(response.error.is_none());
+       assert_eq!(notification_json, "Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":null}");
     }
 }

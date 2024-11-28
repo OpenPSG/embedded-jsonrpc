@@ -1,3 +1,3 @@
 # embedded-jsonrpc
 
-A simple JSON-RPC 2.0 server implementation for embedded systems.
+A JSON-RPC 2.0 server implementation for embedded systems.
