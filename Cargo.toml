@@ -8,12 +8,15 @@ description = "A simple JSON-RPC 2.0 server implementation for embedded systems.
 
 [dependencies]
 defmt = { version = "0.3", optional = true }
+embassy-futures = "0.1.1"
+embassy-sync = "0.6.1"
 embedded-io-async = { version = "0.6.1" }
 heapless = { version = "0.8.0", features = ["serde"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6.0"
 
 [dev-dependencies]
+critical-section = { version = "1.2.0", features = ["std"]}
 tokio = { version = "1.41.1", features = ["full"] }
 
 [features]

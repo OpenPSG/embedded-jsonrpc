@@ -31,11 +31,11 @@
 //! ```rust
 //! use embedded_jsonrpc::{RpcServer, RpcResponse, RpcError, RpcErrorCode, JSONRPC_VERSION};
 //!
-//! const MAX_HANDLERS: usize = 4;
-//! const MAX_REQUEST_LEN: usize = 256;
-//! const MAX_RESPONSE_LEN: usize = 256;
+//! const MAX_CLIENTS: usize = 1;
+//! const MAX_HANDLERS: usize = 2;
+//! const MAX_MESSAGE_LEN: usize = 256;
 //!
-//! let mut server: RpcServer<'_, MAX_HANDLERS, MAX_RESPONSE_LEN> = RpcServer::new();
+//! let mut server: RpcServer<'_, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN> = RpcServer::new();
 //! server.register_method("echo", |id, _request_json, response_json| {
 //!    let response = RpcResponse {
 //!        jsonrpc: JSONRPC_VERSION,
@@ -50,8 +50,7 @@
 //!
 //! ```ignore
 //! let mut stream: YourAsyncStream = YourAsyncStream::new();
-//! let mut rpc_buffer = [0u8; MAX_REQUEST_LEN];
-//! server.serve(&mut stream, &mut rpc_buffer).await.unwrap();
+//! server.serve(&mut stream).await.unwrap();
 //! ```
 //!
 //! ## License
@@ -67,8 +66,13 @@
 //!
 
 use crate::varint::{decode as varint_decode, encode as varint_encode};
+use embassy_futures::select::{select, Either};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    pubsub::{PubSubChannel, WaitResult},
+};
 use embedded_io_async::{Read, Write};
-use heapless::FnvIndexMap;
+use heapless::{FnvIndexMap, Vec};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "defmt")]
@@ -80,6 +84,9 @@ pub mod varint;
 /// Currently only supports version 2.0
 /// https://www.jsonrpc.org/specification
 pub const JSONRPC_VERSION: &str = "2.0";
+
+/// Maximum number of queued, unsent, notifications.
+const MAX_QUEUED_NOTIFICATIONS: usize = 4;
 
 /// JSON-RPC Request structure
 #[derive(Deserialize, Serialize)]
@@ -146,25 +153,38 @@ impl<'a> RpcError<'a> {
 pub type RpcHandler = fn(id: Option<u64>, request_json: &[u8], response_json: &mut [u8]) -> usize;
 
 /// RPC server
-pub struct RpcServer<'a, const MAX_HANDLERS: usize, const MAX_RESPONSE_LEN: usize> {
+pub struct RpcServer<
+    'a,
+    const MAX_CLIENTS: usize,
+    const MAX_HANDLERS: usize,
+    const MAX_MESSAGE_LEN: usize,
+> {
     handlers: FnvIndexMap<&'a str, RpcHandler, MAX_HANDLERS>,
+    notifications: PubSubChannel<
+        CriticalSectionRawMutex,
+        Vec<u8, MAX_MESSAGE_LEN>,
+        MAX_QUEUED_NOTIFICATIONS,
+        MAX_CLIENTS,
+        1,
+    >,
 }
 
-impl<'a, const MAX_HANDLERS: usize, const MAX_RESPONSE_LEN: usize> Default
-    for RpcServer<'a, MAX_HANDLERS, MAX_RESPONSE_LEN>
+impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_LEN: usize> Default
+    for RpcServer<'a, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN>
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a, const MAX_HANDLERS: usize, const MAX_RESPONSE_LEN: usize>
-    RpcServer<'a, MAX_HANDLERS, MAX_RESPONSE_LEN>
+impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_LEN: usize>
+    RpcServer<'a, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN>
 {
     /// Create a new RPC server
     pub fn new() -> Self {
         Self {
             handlers: FnvIndexMap::new(),
+            notifications: PubSubChannel::new(),
         }
     }
 
@@ -223,53 +243,87 @@ impl<'a, const MAX_HANDLERS: usize, const MAX_RESPONSE_LEN: usize>
         };
     }
 
+    /// Broadcast a message to all connected clients.
+    pub async fn notify<T: Write>(&self, notification_json: &[u8]) -> Result<(), T::Error> {
+        let mut notification_json_owned: Vec<u8, MAX_MESSAGE_LEN> = Vec::new();
+
+        notification_json_owned.resize(10, 0).unwrap();
+        let varint_size = varint_encode(notification_json.len(), &mut notification_json_owned);
+        notification_json_owned.truncate(varint_size);
+
+        notification_json_owned
+            .extend_from_slice(notification_json)
+            .unwrap();
+
+        let notifications = self.notifications.publisher().unwrap();
+        notifications.publish(notification_json_owned).await;
+
+        Ok(())
+    }
+
     /// Serve requests using the given stream.
-    pub async fn serve<T: Read + Write>(
-        &self,
-        stream: &mut T,
-        buffer: &mut [u8],
-    ) -> Result<(), T::Error> {
-        let mut response_json = [0u8; MAX_RESPONSE_LEN];
+    pub async fn serve<T: Read + Write>(&self, stream: &mut T) -> Result<(), T::Error> {
+        let mut notifications = self.notifications.subscriber().unwrap();
+
+        let mut request_buffer = [0u8; MAX_MESSAGE_LEN];
+        let mut response_json = [0u8; MAX_MESSAGE_LEN];
         let mut read_offset = 0;
 
         loop {
-            // Read data into the buffer
-            let n = match stream.read(&mut buffer[read_offset..]).await {
-                Ok(0) => return Ok(()), // EOF or connection closed
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
+            let result = select(
+                notifications.next_message(),
+                stream.read(&mut request_buffer[read_offset..]),
+            )
+            .await;
 
-            read_offset += n;
-
-            // Process complete frames from the buffer
-            while let Some((message_length, varint_len)) = varint_decode(&buffer[..read_offset]) {
-                if read_offset < varint_len + message_length {
-                    // Not enough data for a complete message; wait for more
-                    break;
+            match result {
+                Either::First(WaitResult::Message(notification_json)) => {
+                    stream.write_all(&notification_json).await?;
+                    stream.flush().await?;
+                    continue;
                 }
+                Either::First(WaitResult::Lagged(x)) => {
+                    #[cfg(feature = "defmt")]
+                    warn!("Dropped {:?} notifications", x);
+                }
+                Either::Second(Ok(0)) => return Ok(()),
+                Either::Second(Ok(n)) => {
+                    read_offset += n;
 
-                // Extract the full JSON-RPC message
-                let request_json = &buffer[varint_len..varint_len + message_length];
+                    // Process complete frames from the buffer
+                    while let Some((message_length, varint_len)) =
+                        varint_decode(&request_buffer[..read_offset])
+                    {
+                        if read_offset < varint_len + message_length {
+                            // Not enough data for a complete message; wait for more
+                            break;
+                        }
 
-                // Handle the request
-                let response_json_len = self.handle_request(request_json, &mut response_json);
+                        // Extract the full JSON-RPC message
+                        let request_json = &request_buffer[varint_len..varint_len + message_length];
 
-                // Frame the response using varint
-                let mut length_buf = [0u8; 10];
-                let varint_size = varint_encode(response_json_len, &mut length_buf);
+                        // Handle the request
+                        let response_json_len =
+                            self.handle_request(request_json, &mut response_json);
 
-                // Send the framed response
-                stream.write_all(&length_buf[..varint_size]).await?;
-                stream
-                    .write_all(&response_json[..response_json_len])
-                    .await?;
-                stream.flush().await?;
+                        // Frame the response using varint
+                        let mut length_buf = [0u8; 10];
+                        let varint_size = varint_encode(response_json_len, &mut length_buf);
 
-                // Remove processed message from the buffer
-                let remaining = read_offset - (varint_len + message_length);
-                buffer.copy_within(varint_len + message_length..read_offset, 0);
-                read_offset = remaining;
+                        // Send the framed response
+                        stream.write_all(&length_buf[..varint_size]).await?;
+                        stream
+                            .write_all(&response_json[..response_json_len])
+                            .await?;
+                        stream.flush().await?;
+
+                        // Remove processed message from the buffer
+                        let remaining = read_offset - (varint_len + message_length);
+                        request_buffer.copy_within(varint_len + message_length..read_offset, 0);
+                        read_offset = remaining;
+                    }
+                }
+                Either::Second(Err(e)) => return Err(e),
             }
         }
     }
@@ -278,18 +332,20 @@ impl<'a, const MAX_HANDLERS: usize, const MAX_RESPONSE_LEN: usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use memory_pipe::MemoryPipe;
     use std::sync::Arc;
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-    use tokio::sync::Mutex;
+
+    mod memory_pipe;
 
     #[tokio::test]
     async fn test_request_response() {
-        // Create a new server and register the `echo` method
-        const MAX_HANDLERS: usize = 4;
-        const MAX_RESPONSE_LEN: usize = 256;
+        const MAX_CLIENTS: usize = 1;
+        const MAX_HANDLERS: usize = 2;
+        const MAX_MESSAGE_LEN: usize = 256;
 
-        let mut server: RpcServer<'_, MAX_HANDLERS, MAX_RESPONSE_LEN> = RpcServer::new();
+        let mut server: RpcServer<'_, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN> =
+            RpcServer::new();
+
         server.register_method("echo", |id, _request_json, response_json| {
             let response = RpcResponse {
                 jsonrpc: JSONRPC_VERSION,
@@ -303,8 +359,7 @@ mod tests {
         let (mut stream1, mut stream2) = MemoryPipe::new();
 
         tokio::spawn(async move {
-            let mut rpc_buffer = [0; 4096];
-            server.serve(&mut stream2, &mut rpc_buffer).await.unwrap();
+            server.serve(&mut stream2).await.unwrap();
         });
 
         let request = RpcRequest {
@@ -341,68 +396,60 @@ mod tests {
         assert!(response.error.is_none());
     }
 
-    /// A simple in-memory pipe for testing
-    pub struct MemoryPipe {
-        read_rx: Arc<Mutex<UnboundedReceiver<u8>>>,
-        write_tx: Arc<Mutex<UnboundedSender<u8>>>,
-    }
+    #[tokio::test]
+    async fn test_notify() {
+        const MAX_CLIENTS: usize = 2;
+        const MAX_HANDLERS: usize = 2;
+        const MAX_MESSAGE_LEN: usize = 256;
 
-    impl MemoryPipe {
-        pub fn new() -> (Self, Self) {
-            let (tx1, rx1) = unbounded_channel();
-            let (tx2, rx2) = unbounded_channel();
+        let server = Arc::new(RpcServer::<MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN>::new());
 
-            let stream1 = MemoryPipe {
-                read_rx: Arc::new(Mutex::new(rx1)),
-                write_tx: Arc::new(Mutex::new(tx2)),
-            };
+        let server_clone = Arc::clone(&server); // Clone for use in the spawned task
+        let (mut stream1, mut stream2) = MemoryPipe::new();
 
-            let stream2 = MemoryPipe {
-                read_rx: Arc::new(Mutex::new(rx2)),
-                write_tx: Arc::new(Mutex::new(tx1)),
-            };
+        // Spawn the server task to handle notifications
+        tokio::spawn(async move {
+            server_clone.serve(&mut stream2).await.unwrap();
+        });
 
-            (stream1, stream2)
-        }
-    }
+        // Sleep to allow the server task to start and subscribe to notifications
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    impl embedded_io_async::ErrorType for MemoryPipe {
-        type Error = embedded_io_async::ErrorKind;
-    }
+        // Notification to send
+        let notification = RpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            id: None,
+            error: None,
+        };
 
-    impl embedded_io_async::Read for MemoryPipe {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            let mut rx = self.read_rx.lock().await;
-            let mut bytes_read = 0;
+        let mut notification_json = [0u8; MAX_MESSAGE_LEN];
+        let notification_len =
+            serde_json_core::to_slice(&notification, &mut notification_json).unwrap();
 
-            for byte in buf.iter_mut() {
-                if let Some(data) = rx.recv().await {
-                    *byte = data;
-                    bytes_read += 1;
-                } else {
-                    break;
-                }
+        // Notify all clients
+        server
+            .notify::<MemoryPipe>(&notification_json[..notification_len])
+            .await
+            .unwrap();
 
-                // No more data to read.
-                if rx.is_empty() {
-                    break;
-                }
-            }
+        // Read the notification from the stream
+        let mut read_length_buf = [0u8; 1];
+        stream1.read_exact(&mut read_length_buf[..]).await.unwrap();
+        let (received_len, _) = varint_decode(&read_length_buf).unwrap();
 
-            Ok(bytes_read)
-        }
-    }
+        assert_eq!(received_len, notification_len);
 
-    impl embedded_io_async::Write for MemoryPipe {
-        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            let tx = self.write_tx.lock().await;
+        let mut received_notification = vec![0u8; received_len];
+        stream1
+            .read_exact(&mut received_notification)
+            .await
+            .unwrap();
 
-            for byte in buf {
-                tx.send(*byte)
-                    .map_err(|_| embedded_io_async::ErrorKind::WriteZero)?;
-            }
+        let (response, _): (RpcResponse, usize) =
+            serde_json_core::from_slice(&received_notification).unwrap();
 
-            Ok(buf.len())
-        }
+        assert_eq!(response.jsonrpc, JSONRPC_VERSION);
+        assert_eq!(response.id, None);
+        assert!(response.error.is_none());
     }
 }
