@@ -1,6 +1,6 @@
 [package]
 name = "embedded-jsonrpc"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "A JSON-RPC 2.0 server implementation for embedded systems."
@@ -19,5 +19,6 @@ critical-section = { version = "1.2.0", features = ["std"]}
 tokio = { version = "1.41.1", features = ["full"] }
 
 [features]
-default = []
+default = ["std"]
 defmt = ["dep:defmt"]
+std = []
