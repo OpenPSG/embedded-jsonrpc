@@ -209,11 +209,6 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         self.handlers.insert(name, handler).unwrap();
     }
 
-    /// Get the maximum message length supported by the server.
-    pub fn max_message_len(&self) -> usize {
-        MAX_MESSAGE_LEN
-    }
-
     /// Broadcast a message to all connected clients.
     pub async fn notify(&self, notification_json: &[u8]) -> Result<(), RpcServerError> {
         let mut headers: String<32> = String::new();
@@ -486,11 +481,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Notification to send
-        let notification: RpcResponse<'_, ()> = RpcResponse {
+        let notification: RpcRequest<'_, ()> = RpcRequest {
             jsonrpc: JSONRPC_VERSION,
+            method: "notify",
             id: None,
-            error: None,
-            result: None,
+            params: None,
         };
 
         let mut notification_json = [0u8; DEFAULT_MAX_MESSAGE_LEN];
@@ -512,7 +507,7 @@ mod tests {
 
         assert_eq!(
             notification_json,
-            "Content-Length: 54\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":null,\"result\":null}"
+            "Content-Length: 59\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"notify\",\"params\":null}",
         );
     }
 }
