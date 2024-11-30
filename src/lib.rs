@@ -207,7 +207,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
     }
 
     /// Broadcast a message to all connected clients.
-    pub async fn notify<T: Write>(&self, notification_json: &[u8]) -> Result<(), RpcServerError> {
+    pub async fn notify(&self, notification_json: &[u8]) -> Result<(), RpcServerError> {
         let mut headers: String<32> = String::new();
         core::fmt::write(
             &mut headers,
@@ -485,7 +485,7 @@ mod tests {
 
         // Notify all clients
         server
-            .notify::<MemoryPipe>(&notification_json[..notification_len])
+            .notify(&notification_json[..notification_len])
             .await
             .unwrap();
 
