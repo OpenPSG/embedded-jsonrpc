@@ -209,6 +209,11 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         self.handlers.insert(name, handler).unwrap();
     }
 
+    /// Get the maximum message length supported by the server.
+    pub fn max_message_len(&self) -> usize {
+        MAX_MESSAGE_LEN
+    }
+
     /// Broadcast a message to all connected clients.
     pub async fn notify(&self, notification_json: &[u8]) -> Result<(), RpcServerError> {
         let mut headers: String<32> = String::new();
