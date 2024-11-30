@@ -19,10 +19,11 @@
 //!
 //! let mut server: RpcServer<'_> = RpcServer::new();
 //! server.register_method("echo", |id, _request_json, response_json| {
-//!    let response = RpcResponse {
+//!    let response: RpcResponse<'_, ()> = RpcResponse {
 //!        jsonrpc: JSONRPC_VERSION,
-//!        id,
 //!        error: None,
+//!        result: None,
+//!        id,
 //!    };
 //!    Ok(serde_json_core::to_slice(&response, response_json).unwrap())
 //! });
@@ -77,23 +78,25 @@ use defmt::*;
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// JSON-RPC Request structure
-#[derive(Deserialize, Serialize)]
-pub struct RpcRequest<'a> {
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RpcRequest<'a, T> {
     pub jsonrpc: &'a str,
     pub id: Option<u64>,
     pub method: &'a str,
+    pub params: Option<T>,
 }
 
 /// JSON-RPC Response structure
-#[derive(Deserialize, Serialize)]
-pub struct RpcResponse<'a> {
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RpcResponse<'a, T> {
     pub jsonrpc: &'a str,
     pub id: Option<u64>,
     pub error: Option<RpcError<'a>>,
+    pub result: Option<T>,
 }
 
 /// JSON-RPC Standard Error Codes
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub enum RpcErrorCode {
     ParseError = -32700,
@@ -121,7 +124,7 @@ impl RpcErrorCode {
 }
 
 /// JSON-RPC Error structure
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RpcError<'a> {
     pub code: RpcErrorCode,
     pub message: &'a str,
@@ -320,8 +323,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
 
     /// Handle a single JSON-RPC request
     fn handle_request(&self, request_json: &[u8], response_json: &mut [u8]) -> usize {
-        let request: RpcRequest = match serde_json_core::from_slice::<RpcRequest<'_>>(request_json)
-        {
+        let request: RpcRequest<'_, ()> = match serde_json_core::from_slice(request_json) {
             Ok((request, _remainder)) => request,
             Err(_) => {
                 if let Ok(json_str) = core::str::from_utf8(request_json) {
@@ -332,10 +334,11 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
                     warn!("Invalid JSON-RPC request: [non-UTF8 data]")
                 }
 
-                let response = RpcResponse {
+                let response: RpcResponse<'_, ()> = RpcResponse {
                     jsonrpc: JSONRPC_VERSION,
                     error: Some(RpcError::from_code(RpcErrorCode::ParseError)),
                     id: None,
+                    result: None,
                 };
 
                 return serde_json_core::to_slice(&response, &mut response_json[..]).unwrap();
@@ -345,9 +348,10 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         let id = request.id;
 
         if request.jsonrpc != JSONRPC_VERSION {
-            let response = RpcResponse {
+            let response: RpcResponse<'_, ()> = RpcResponse {
                 jsonrpc: JSONRPC_VERSION,
                 error: Some(RpcError::from_code(RpcErrorCode::InvalidRequest)),
+                result: None,
                 id,
             };
 
@@ -358,9 +362,10 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
             Some(handler) => match handler(id, request_json, response_json) {
                 Ok(response_len) => response_len,
                 Err(e) => {
-                    let response = RpcResponse {
+                    let response: RpcResponse<'_, ()> = RpcResponse {
                         jsonrpc: JSONRPC_VERSION,
                         error: Some(e),
+                        result: None,
                         id,
                     };
 
@@ -368,9 +373,10 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
                 }
             },
             None => {
-                let response = RpcResponse {
+                let response: RpcResponse<'_, ()> = RpcResponse {
                     jsonrpc: JSONRPC_VERSION,
                     error: Some(RpcError::from_code(RpcErrorCode::MethodNotFound)),
+                    result: None,
                     id,
                 };
 
@@ -413,10 +419,11 @@ mod tests {
         let mut server: RpcServer<'_> = RpcServer::new();
 
         server.register_method("echo", |id, _request_json, response_json| {
-            let response = RpcResponse {
+            let response: RpcResponse<'_, ()> = RpcResponse {
                 jsonrpc: JSONRPC_VERSION,
-                id,
                 error: None,
+                result: None,
+                id,
             };
 
             Ok(serde_json_core::to_slice(&response, response_json).unwrap())
@@ -428,10 +435,11 @@ mod tests {
             server.serve(&mut stream2).await.unwrap();
         });
 
-        let request = RpcRequest {
+        let request: RpcRequest<'_, ()> = RpcRequest {
             jsonrpc: JSONRPC_VERSION,
             id: Some(1),
             method: "echo",
+            params: None,
         };
 
         let mut request_json = [0u8; 256];
@@ -453,7 +461,7 @@ mod tests {
 
         assert_eq!(
             response,
-            "Content-Length: 37\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":null}"
+            "Content-Length: 51\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":null,\"result\":null}"
         );
     }
 
@@ -473,10 +481,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Notification to send
-        let notification = RpcResponse {
+        let notification: RpcResponse<'_, ()> = RpcResponse {
             jsonrpc: JSONRPC_VERSION,
             id: None,
             error: None,
+            result: None,
         };
 
         let mut notification_json = [0u8; DEFAULT_MAX_MESSAGE_LEN];
@@ -498,7 +507,7 @@ mod tests {
 
         assert_eq!(
             notification_json,
-            "Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":null}"
+            "Content-Length: 54\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":null,\"result\":null}"
         );
     }
 }
