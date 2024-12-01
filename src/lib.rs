@@ -18,7 +18,6 @@
 //! use embedded_jsonrpc::{RpcError, RpcResponse, RpcServer, RpcHandler, JSONRPC_VERSION, DEFAULT_STACK_SIZE};
 //! use stackfuture::StackFuture;
 //!
-//! #[derive(Debug)]
 //! struct MyHandler;
 //!
 //! impl RpcHandler for MyHandler {
@@ -170,7 +169,7 @@ pub const DEFAULT_MAX_MESSAGE_LEN: usize = 512;
 pub const DEFAULT_STACK_SIZE: usize = 256;
 
 /// Trait for RPC handlers
-pub trait RpcHandler<const STACK_SIZE: usize = DEFAULT_STACK_SIZE>: Debug + Sync {
+pub trait RpcHandler<const STACK_SIZE: usize = DEFAULT_STACK_SIZE>: Sync {
     fn handle<'a>(
         &self,
         id: Option<u64>,
@@ -213,7 +212,9 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
 
     /// Register a new RPC method and its handler
     pub fn register_method(&mut self, name: &'a str, handler: &'a dyn RpcHandler) {
-        self.handlers.insert(name, handler).unwrap();
+        if !self.handlers.insert(name, handler).is_ok() {
+            panic!("Too many handlers registered");
+        }
     }
 
     /// Broadcast a message to all connected clients.
@@ -508,7 +509,6 @@ mod tests {
         );
     }
 
-    #[derive(Debug)]
     struct EchoHandler;
 
     impl RpcHandler for EchoHandler {
