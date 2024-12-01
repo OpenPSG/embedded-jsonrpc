@@ -174,7 +174,7 @@ pub const DEFAULT_STACK_SIZE: usize = 256;
 /// Trait for RPC handlers
 pub trait RpcHandler<const STACK_SIZE: usize = DEFAULT_STACK_SIZE>: Sync {
     fn handle<'a>(
-        &self,
+        &'a self,
         id: Option<u64>,
         request_json: &'a [u8],
         response_json: &'a mut [u8],
