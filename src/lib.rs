@@ -15,18 +15,28 @@
 //! ### Create an RPC Server
 //!
 //! ```rust
-//! use embedded_jsonrpc::{RpcServer, RpcResponse, JSONRPC_VERSION};
+//! use embedded_jsonrpc::{RpcError, RpcResponse, RpcServer, RpcHandler, JSONRPC_VERSION, DEFAULT_STACK_SIZE};
+//! use stackfuture::StackFuture;
+//!
+//! #[derive(Debug)]
+//! struct MyHandler;
+//!
+//! impl RpcHandler for MyHandler {
+//!    fn handle<'a>(&self, id: Option<u64>, _request_json: &'a [u8], response_json: &'a mut [u8]) -> StackFuture<'a, Result<usize, RpcError>, DEFAULT_STACK_SIZE> {
+//!       StackFuture::from(async move {
+//!          let response: RpcResponse<'static, ()> = RpcResponse {
+//!            jsonrpc: JSONRPC_VERSION,
+//!            error: None,
+//!            result: None,
+//!            id,
+//!          };
+//!         Ok(serde_json_core::to_slice(&response, response_json).unwrap())
+//!      })
+//!   }
+//! }
 //!
 //! let mut server: RpcServer<'_> = RpcServer::new();
-//! server.register_method("echo", |id, _request_json, response_json| {
-//!    let response: RpcResponse<'_, ()> = RpcResponse {
-//!        jsonrpc: JSONRPC_VERSION,
-//!        error: None,
-//!        result: None,
-//!        id,
-//!    };
-//!    Ok(serde_json_core::to_slice(&response, response_json).unwrap())
-//! });
+//! server.register_method("echo", &MyHandler);
 //! ```
 //!
 //! ### Serve Requests
@@ -68,6 +78,7 @@ use embassy_sync::{
 use embedded_io_async::{Read, Write};
 use heapless::{FnvIndexMap, String, Vec};
 use serde::{Deserialize, Serialize};
+use stackfuture::StackFuture;
 
 #[cfg(feature = "defmt")]
 use defmt::*;
@@ -91,7 +102,7 @@ pub struct RpcRequest<'a, T> {
 pub struct RpcResponse<'a, T> {
     pub jsonrpc: &'a str,
     pub id: Option<u64>,
-    pub error: Option<RpcError<'a>>,
+    pub error: Option<RpcError>,
     pub result: Option<T>,
 }
 
@@ -107,35 +118,31 @@ pub enum RpcErrorCode {
 }
 
 impl RpcErrorCode {
-    /// Get the standard message for the error code
+    /// Get the standard message for the error code.
     pub fn message(self) -> &'static str {
         match self {
-            RpcErrorCode::ParseError => "Parse error: Invalid JSON received by the server.",
-            RpcErrorCode::InvalidRequest => {
-                "Invalid Request: The JSON sent is not a valid Request object."
-            }
-            RpcErrorCode::MethodNotFound => {
-                "Method not found: The method does not exist or is not available."
-            }
-            RpcErrorCode::InvalidParams => "Invalid params: Invalid method parameter(s).",
-            RpcErrorCode::InternalError => "Internal error: Internal JSON-RPC error.",
+            RpcErrorCode::ParseError => "Invalid JSON.",
+            RpcErrorCode::InvalidRequest => "Invalid request.",
+            RpcErrorCode::MethodNotFound => "Method not found.",
+            RpcErrorCode::InvalidParams => "Invalid parameters.",
+            RpcErrorCode::InternalError => "Internal error.",
         }
     }
 }
 
 /// JSON-RPC Error structure
 #[derive(Debug, Deserialize, Serialize)]
-pub struct RpcError<'a> {
+pub struct RpcError {
     pub code: RpcErrorCode,
-    pub message: &'a str,
+    pub message: String<32>,
 }
 
-impl<'a> RpcError<'a> {
+impl RpcError {
     /// Create a new `RpcError` from `RpcErrorCode`
     pub fn from_code(code: RpcErrorCode) -> Self {
         RpcError {
             code,
-            message: code.message(),
+            message: String::try_from(code.message()).unwrap(),
         }
     }
 }
@@ -152,21 +159,25 @@ pub enum RpcServerError {
     ParseError,
 }
 
-/// Type for RPC handler functions
-pub type RpcHandler = fn(
-    id: Option<u64>,
-    request_json: &[u8],
-    response_json: &mut [u8],
-) -> Result<usize, RpcError<'static>>;
-
 /// Default maximum number of clients.
-const DEFAULT_MAX_CLIENTS: usize = 4;
+pub const DEFAULT_MAX_CLIENTS: usize = 4;
 /// Maximum number of registered RPC methods.
-const DEFAULT_MAX_HANDLERS: usize = 8;
+pub const DEFAULT_MAX_HANDLERS: usize = 8;
 /// Maximum length of a JSON-RPC message (including headers).
-const DEFAULT_MAX_MESSAGE_LEN: usize = 512;
-/// Maximum number of queued, unsent, notifications.
-const MAX_QUEUED_NOTIFICATIONS: usize = 4;
+pub const DEFAULT_MAX_MESSAGE_LEN: usize = 512;
+/// Default stack size for futures.
+/// This is a rough estimate and may need to be adjusted based on the complexity of the handler.
+pub const DEFAULT_STACK_SIZE: usize = 256;
+
+/// Trait for RPC handlers
+pub trait RpcHandler<const STACK_SIZE: usize = DEFAULT_STACK_SIZE>: Debug + Sync {
+    fn handle<'a>(
+        &self,
+        id: Option<u64>,
+        request_json: &'a [u8],
+        response_json: &'a mut [u8],
+    ) -> StackFuture<'a, Result<usize, RpcError>, STACK_SIZE>;
+}
 
 /// RPC server
 pub struct RpcServer<
@@ -174,15 +185,11 @@ pub struct RpcServer<
     const MAX_CLIENTS: usize = DEFAULT_MAX_CLIENTS,
     const MAX_HANDLERS: usize = DEFAULT_MAX_HANDLERS,
     const MAX_MESSAGE_LEN: usize = DEFAULT_MAX_MESSAGE_LEN,
+    const STACK_SIZE: usize = DEFAULT_STACK_SIZE,
 > {
-    handlers: FnvIndexMap<&'a str, RpcHandler, MAX_HANDLERS>,
-    notifications: PubSubChannel<
-        CriticalSectionRawMutex,
-        Vec<u8, MAX_MESSAGE_LEN>,
-        MAX_QUEUED_NOTIFICATIONS,
-        MAX_CLIENTS,
-        1,
-    >,
+    handlers: FnvIndexMap<&'a str, &'a dyn RpcHandler<STACK_SIZE>, MAX_HANDLERS>,
+    notifications:
+        PubSubChannel<CriticalSectionRawMutex, Vec<u8, MAX_MESSAGE_LEN>, 2, MAX_CLIENTS, 1>,
 }
 
 impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_LEN: usize> Default
@@ -205,7 +212,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
     }
 
     /// Register a new RPC method and its handler
-    pub fn register_method(&mut self, name: &'a str, handler: RpcHandler) {
+    pub fn register_method(&mut self, name: &'a str, handler: &'a dyn RpcHandler) {
         self.handlers.insert(name, handler).unwrap();
     }
 
@@ -285,7 +292,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
                         // Process the complete JSON-RPC message.
                         let request_json = &request_buffer[headers_len..headers_len + content_len];
                         let response_json_len =
-                            self.handle_request(request_json, &mut response_json);
+                            self.handle_request(request_json, &mut response_json).await;
 
                         // Construct the response
                         let mut headers: String<32> = String::new();
@@ -322,7 +329,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
     }
 
     /// Handle a single JSON-RPC request
-    fn handle_request(&self, request_json: &[u8], response_json: &mut [u8]) -> usize {
+    async fn handle_request(&self, request_json: &'a [u8], response_json: &'a mut [u8]) -> usize {
         let request: RpcRequest<'_, ()> = match serde_json_core::from_slice(request_json) {
             Ok((request, _remainder)) => request,
             Err(_) => {
@@ -359,7 +366,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         }
 
         return match self.handlers.get(request.method) {
-            Some(handler) => match handler(id, request_json, response_json) {
+            Some(handler) => match handler.handle(id, request_json, response_json).await {
                 Ok(response_len) => response_len,
                 Err(e) => {
                     let response: RpcResponse<'_, ()> = RpcResponse {
@@ -417,17 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_response() {
         let mut server: RpcServer<'_> = RpcServer::new();
-
-        server.register_method("echo", |id, _request_json, response_json| {
-            let response: RpcResponse<'_, ()> = RpcResponse {
-                jsonrpc: JSONRPC_VERSION,
-                error: None,
-                result: None,
-                id,
-            };
-
-            Ok(serde_json_core::to_slice(&response, response_json).unwrap())
-        });
+        server.register_method("echo", &EchoHandler);
 
         let (mut stream1, mut stream2) = MemoryPipe::new();
 
@@ -509,5 +506,28 @@ mod tests {
             notification_json,
             "Content-Length: 59\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"notify\",\"params\":null}",
         );
+    }
+
+    #[derive(Debug)]
+    struct EchoHandler;
+
+    impl RpcHandler for EchoHandler {
+        fn handle<'a>(
+            &self,
+            id: Option<u64>,
+            _request_json: &'a [u8],
+            response_json: &'a mut [u8],
+        ) -> StackFuture<'a, Result<usize, RpcError>, DEFAULT_STACK_SIZE> {
+            StackFuture::from(async move {
+                let response: RpcResponse<'static, ()> = RpcResponse {
+                    jsonrpc: JSONRPC_VERSION,
+                    error: None,
+                    result: None,
+                    id,
+                };
+
+                Ok(serde_json_core::to_slice(&response, response_json).unwrap())
+            })
+        }
     }
 }

@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "embedded-jsonrpc"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "critical-section",
  "defmt",
@@ -153,6 +153,7 @@ dependencies = [
  "heapless",
  "serde",
  "serde-json-core",
+ "stackfuture",
  "tokio",
 ]
 
@@ -435,6 +436,12 @@ name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
+
+[[package]]
+name = "stackfuture"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6eae92052b72ef70dafa16eddbabffc77e5ca3574be2f7bc1127b36f0a7ad7f2"
 
 [[package]]
 name = "syn"
