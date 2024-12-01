@@ -1,6 +1,6 @@
 [package]
 name = "embedded-jsonrpc"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 license = "MPL-2.0"
 description = "A JSON-RPC 2.0 server implementation for embedded systems."
@@ -13,13 +13,12 @@ embedded-io-async = { version = "0.6.1" }
 heapless = { version = "0.8.0", features = ["serde"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6.0"
-stackfuture = { version = "0.3.0", default-features = false }
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"]}
+futures = "0.3"
 tokio = { version = "1.41.1", features = ["full"] }
 
 [features]
-default = ["std"]
+default = []
 defmt = ["dep:defmt"]
-std = []

@@ -16,7 +16,7 @@
 //!
 //! ```rust
 //! use embedded_jsonrpc::{RpcError, RpcResponse, RpcServer, RpcHandler, JSONRPC_VERSION, DEFAULT_STACK_SIZE};
-//! use stackfuture::StackFuture;
+//! use embedded_jsonrpc::stackfuture::StackFuture;
 //!
 //! struct MyHandler;
 //!
@@ -57,7 +57,7 @@
 //! - [Embedded IO Async](https://docs.rs/embedded-io-async)
 //!
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(test), no_std)]
 
 use core::clone::Clone;
 use core::cmp::{Eq, PartialEq};
@@ -81,6 +81,8 @@ use stackfuture::StackFuture;
 
 #[cfg(feature = "defmt")]
 use defmt::*;
+
+pub mod stackfuture;
 
 /// JSON-RPC Version
 /// Currently only supports version 2.0
@@ -194,16 +196,26 @@ pub struct RpcServer<
         PubSubChannel<CriticalSectionRawMutex, Vec<u8, MAX_MESSAGE_LEN>, 2, MAX_CLIENTS, 1>,
 }
 
-impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_LEN: usize> Default
-    for RpcServer<'a, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN>
+impl<
+        'a,
+        const MAX_CLIENTS: usize,
+        const MAX_HANDLERS: usize,
+        const MAX_MESSAGE_LEN: usize,
+        const STACK_SIZE: usize,
+    > Default for RpcServer<'a, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN, STACK_SIZE>
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_LEN: usize>
-    RpcServer<'a, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN>
+impl<
+        'a,
+        const MAX_CLIENTS: usize,
+        const MAX_HANDLERS: usize,
+        const MAX_MESSAGE_LEN: usize,
+        const STACK_SIZE: usize,
+    > RpcServer<'a, MAX_CLIENTS, MAX_HANDLERS, MAX_MESSAGE_LEN, STACK_SIZE>
 {
     /// Create a new RPC server
     pub fn new() -> Self {
@@ -217,7 +229,7 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
     pub fn register_method(
         &mut self,
         name: &'a str,
-        handler: &'a dyn RpcHandler,
+        handler: &'a dyn RpcHandler<STACK_SIZE>,
     ) -> Result<(), RpcServerError> {
         if self.handlers.insert(name, handler).is_err() {
             return Err(RpcServerError::TooManyHandlers);
