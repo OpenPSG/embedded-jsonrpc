@@ -109,6 +109,13 @@ pub struct RpcRequest<'a, T> {
     pub params: Option<T>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RpcRequestMetadata<'a> {
+    pub jsonrpc: &'a str,
+    pub id: Option<u64>,
+    pub method: &'a str,
+}
+
 /// JSON-RPC Response structure
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RpcResponse<'a, T> {
@@ -119,7 +126,7 @@ pub struct RpcResponse<'a, T> {
 }
 
 /// JSON-RPC Standard Error Codes
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub enum RpcErrorCode {
     ParseError = -32700,
@@ -138,6 +145,32 @@ impl RpcErrorCode {
             RpcErrorCode::MethodNotFound => "Method not found.",
             RpcErrorCode::InvalidParams => "Invalid parameters.",
             RpcErrorCode::InternalError => "Internal error.",
+        }
+    }
+}
+
+impl Serialize for RpcErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        (*self as i32).serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for RpcErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<RpcErrorCode, D::Error>
+    where
+        D: serde::de::Deserializer<'a>,
+    {
+        let code = i32::deserialize(deserializer)?;
+        match code {
+            -32700 => Ok(RpcErrorCode::ParseError),
+            -32600 => Ok(RpcErrorCode::InvalidRequest),
+            -32601 => Ok(RpcErrorCode::MethodNotFound),
+            -32602 => Ok(RpcErrorCode::InvalidParams),
+            -32603 => Ok(RpcErrorCode::InternalError),
+            _ => Err(serde::de::Error::custom("Invalid error code")),
         }
     }
 }
@@ -353,7 +386,7 @@ impl<
 
     /// Handle a single JSON-RPC request
     async fn handle_request(&self, request_json: &'a [u8], response_json: &'a mut [u8]) -> usize {
-        let request: RpcRequest<'_, ()> = match serde_json_core::from_slice(request_json) {
+        let request: RpcRequestMetadata = match serde_json_core::from_slice(request_json) {
             Ok((request, _remainder)) => request,
             Err(_) => {
                 let response: RpcResponse<'_, ()> = RpcResponse {
