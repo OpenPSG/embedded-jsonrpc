@@ -150,12 +150,15 @@ impl RpcError {
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RpcServerError {
-    /// Buffer overflow error, e.g. message too large
+    /// Buffer overflow error, e.g. message too large.
     BufferOverflow,
-    /// IO error, e.g. read/write error
+    /// IO error, e.g. read/write error.
     IoError,
-    // Parse error, e.g. invalid JSON
+    // Parse error, e.g. invalid JSON.
     ParseError,
+    /// Too many registered handlers
+    /// The maximum number of handlers is defined by `MAX_HANDLERS`.
+    TooManyHandlers,
 }
 
 /// Default maximum number of clients.
@@ -211,10 +214,15 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
     }
 
     /// Register a new RPC method and its handler
-    pub fn register_method(&mut self, name: &'a str, handler: &'a dyn RpcHandler) {
-        if !self.handlers.insert(name, handler).is_ok() {
-            panic!("Too many handlers registered");
+    pub fn register_method(
+        &mut self,
+        name: &'a str,
+        handler: &'a dyn RpcHandler,
+    ) -> Result<(), RpcServerError> {
+        if self.handlers.insert(name, handler).is_err() {
+            return Err(RpcServerError::TooManyHandlers);
         }
+        Ok(())
     }
 
     /// Broadcast a message to all connected clients.
@@ -334,14 +342,6 @@ impl<'a, const MAX_CLIENTS: usize, const MAX_HANDLERS: usize, const MAX_MESSAGE_
         let request: RpcRequest<'_, ()> = match serde_json_core::from_slice(request_json) {
             Ok((request, _remainder)) => request,
             Err(_) => {
-                if let Ok(json_str) = core::str::from_utf8(request_json) {
-                    #[cfg(feature = "defmt")]
-                    warn!("Invalid JSON-RPC request: {}", json_str)
-                } else {
-                    #[cfg(feature = "defmt")]
-                    warn!("Invalid JSON-RPC request: [non-UTF8 data]")
-                }
-
                 let response: RpcResponse<'_, ()> = RpcResponse {
                     jsonrpc: JSONRPC_VERSION,
                     error: Some(RpcError::from_code(RpcErrorCode::ParseError)),
@@ -425,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_response() {
         let mut server: RpcServer<'_> = RpcServer::new();
-        server.register_method("echo", &EchoHandler);
+        server.register_method("echo", &EchoHandler).unwrap();
 
         let (mut stream1, mut stream2) = MemoryPipe::new();
 

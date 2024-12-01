@@ -1,6 +1,6 @@
 [package]
 name = "embedded-jsonrpc"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MPL-2.0"
 description = "A JSON-RPC 2.0 server implementation for embedded systems."
