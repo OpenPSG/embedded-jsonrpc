@@ -84,6 +84,17 @@ use defmt::*;
 
 pub mod stackfuture;
 
+/// Default maximum number of clients.
+pub const DEFAULT_MAX_CLIENTS: usize = 4;
+/// Maximum number of registered RPC methods.
+pub const DEFAULT_MAX_HANDLERS: usize = 8;
+/// Maximum length of a JSON-RPC message (including headers).
+/// Default to the largest message that'll fit in a single Ethernet frame.
+pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1460;
+/// Default stack size for futures.
+/// This is a rough estimate and will need to be adjusted based on the complexity of your handlers.
+pub const DEFAULT_STACK_SIZE: usize = 256;
+
 /// JSON-RPC Version
 /// Currently only supports version 2.0
 /// https://www.jsonrpc.org/specification
@@ -162,16 +173,6 @@ pub enum RpcServerError {
     /// The maximum number of handlers is defined by `MAX_HANDLERS`.
     TooManyHandlers,
 }
-
-/// Default maximum number of clients.
-pub const DEFAULT_MAX_CLIENTS: usize = 4;
-/// Maximum number of registered RPC methods.
-pub const DEFAULT_MAX_HANDLERS: usize = 8;
-/// Maximum length of a JSON-RPC message (including headers).
-pub const DEFAULT_MAX_MESSAGE_LEN: usize = 512;
-/// Default stack size for futures.
-/// This is a rough estimate and may need to be adjusted based on the complexity of the handler.
-pub const DEFAULT_STACK_SIZE: usize = 256;
 
 /// Trait for RPC handlers
 pub trait RpcHandler<const STACK_SIZE: usize = DEFAULT_STACK_SIZE>: Sync {
