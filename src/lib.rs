@@ -21,7 +21,7 @@
 //! struct MyHandler;
 //!
 //! impl RpcHandler for MyHandler {
-//!    fn handle<'a>(&self, id: Option<u64>, _request_json: &'a [u8], response_json: &'a mut [u8]) -> StackFuture<'a, Result<usize, RpcError>, DEFAULT_STACK_SIZE> {
+//!    fn handle<'a>(&self, id: Option<u64>, _method: &'a str, _request_json: &'a [u8], response_json: &'a mut [u8]) -> StackFuture<'a, Result<usize, RpcError>, DEFAULT_STACK_SIZE> {
 //!       StackFuture::from(async move {
 //!          let response: RpcResponse<'static, ()> = RpcResponse {
 //!            jsonrpc: JSONRPC_VERSION,
@@ -178,6 +178,7 @@ pub trait RpcHandler<const STACK_SIZE: usize = DEFAULT_STACK_SIZE>: Sync {
     fn handle<'a>(
         &'a self,
         id: Option<u64>,
+        method: &'a str,
         request_json: &'a [u8],
         response_json: &'a mut [u8],
     ) -> StackFuture<'a, Result<usize, RpcError>, STACK_SIZE>;
@@ -379,7 +380,10 @@ impl<
         }
 
         return match self.handlers.get(request.method) {
-            Some(handler) => match handler.handle(id, request_json, response_json).await {
+            Some(handler) => match handler
+                .handle(id, request.method, request_json, response_json)
+                .await
+            {
                 Ok(response_len) => response_len,
                 Err(e) => {
                     let response: RpcResponse<'_, ()> = RpcResponse {
@@ -527,6 +531,7 @@ mod tests {
         fn handle<'a>(
             &self,
             id: Option<u64>,
+            _method: &'a str,
             _request_json: &'a [u8],
             response_json: &'a mut [u8],
         ) -> StackFuture<'a, Result<usize, RpcError>, DEFAULT_STACK_SIZE> {
