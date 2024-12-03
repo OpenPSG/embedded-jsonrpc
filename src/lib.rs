@@ -74,6 +74,7 @@ use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     pubsub::{PubSubChannel, WaitResult},
 };
+use embassy_time::{with_timeout, Duration};
 use embedded_io_async::{Read, Write};
 use heapless::{FnvIndexMap, String, Vec};
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,12 @@ pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1460;
 /// Default stack size for futures.
 /// This is a rough estimate and will need to be adjusted based on the complexity of your handlers.
 pub const DEFAULT_STACK_SIZE: usize = 256;
+/// Default write timeout in milliseconds.
+/// This is the maximum time allowed for writing to the stream.
+pub const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5000;
+/// Default handler timeout in milliseconds.
+/// This is the maximum time allowed for a handler to process a request.
+pub const DEFAULT_HANDLER_TIMEOUT_MS: u64 = 5000;
 
 /// JSON-RPC Version
 /// Currently only supports version 2.0
@@ -126,8 +133,9 @@ pub struct RpcResponse<'a, T> {
 }
 
 /// JSON-RPC Standard Error Codes
-#[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RpcErrorCode {
     ParseError = -32700,
     InvalidRequest = -32600,
@@ -177,6 +185,7 @@ impl<'a> Deserialize<'a> for RpcErrorCode {
 
 /// JSON-RPC Error structure
 #[derive(Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RpcError {
     pub code: RpcErrorCode,
     pub message: String<32>,
@@ -205,6 +214,9 @@ pub enum RpcServerError {
     /// Too many registered handlers
     /// The maximum number of handlers is defined by `MAX_HANDLERS`.
     TooManyHandlers,
+    /// Timeout error
+    /// The operation took longer than the specified timeout.
+    TimeoutError,
 }
 
 /// Trait for RPC handlers
@@ -228,7 +240,7 @@ pub struct RpcServer<
 > {
     handlers: FnvIndexMap<&'a str, &'a dyn RpcHandler<STACK_SIZE>, MAX_HANDLERS>,
     notifications:
-        PubSubChannel<CriticalSectionRawMutex, Vec<u8, MAX_MESSAGE_LEN>, 2, MAX_CLIENTS, 1>,
+        PubSubChannel<CriticalSectionRawMutex, Vec<u8, MAX_MESSAGE_LEN>, 1, MAX_CLIENTS, 1>,
 }
 
 impl<
@@ -254,6 +266,9 @@ impl<
 {
     /// Create a new RPC server
     pub fn new() -> Self {
+        #[cfg(feature = "defmt")]
+        debug!("Initializing new RPC server");
+
         Self {
             handlers: FnvIndexMap::new(),
             notifications: PubSubChannel::new(),
@@ -266,34 +281,42 @@ impl<
         name: &'a str,
         handler: &'a dyn RpcHandler<STACK_SIZE>,
     ) -> Result<(), RpcServerError> {
+        #[cfg(feature = "defmt")]
+        debug!("Registering method: {}", name);
+
         if self.handlers.insert(name, handler).is_err() {
+            #[cfg(feature = "defmt")]
+            warn!("Failed to register method (too many handlers): {}", name);
             return Err(RpcServerError::TooManyHandlers);
         }
+
         Ok(())
     }
 
     /// Broadcast a message to all connected clients.
     pub async fn notify(&self, notification_json: &[u8]) -> Result<(), RpcServerError> {
+        #[cfg(feature = "defmt")]
+        debug!("Broadcasting notification");
+
         let mut headers: String<32> = String::new();
         core::fmt::write(
             &mut headers,
             format_args!("Content-Length: {}\r\n\r\n", notification_json.len()),
         )
         .unwrap();
+
         if headers.len() + notification_json.len() > MAX_MESSAGE_LEN {
+            #[cfg(feature = "defmt")]
+            error!("Broadcast message too large");
             return Err(RpcServerError::BufferOverflow);
         }
 
-        // Construct the framed message
         let mut framed_message: heapless::Vec<u8, MAX_MESSAGE_LEN> = heapless::Vec::new();
-
-        // Add header and payload to the message buffer
         framed_message
             .extend_from_slice(headers.as_bytes())
             .unwrap();
         framed_message.extend_from_slice(notification_json).unwrap();
 
-        // Publish the message to the notification channel
         let notifications = self.notifications.publisher().unwrap();
         notifications.publish(framed_message).await;
 
@@ -302,13 +325,18 @@ impl<
 
     /// Serve requests using the given stream.
     pub async fn serve<T: Read + Write>(&self, stream: &mut T) -> Result<(), RpcServerError> {
-        let mut notifications = self.notifications.subscriber().unwrap();
+        #[cfg(feature = "defmt")]
+        debug!("Starting RPC server");
 
+        let mut notifications = self.notifications.subscriber().unwrap();
         let mut request_buffer = [0u8; MAX_MESSAGE_LEN];
         let mut response_json = [0u8; MAX_MESSAGE_LEN];
         let mut read_offset = 0;
 
         loop {
+            #[cfg(feature = "defmt")]
+            debug!("Waiting for data from client");
+
             let result = select(
                 notifications.next_message(),
                 stream.read(&mut request_buffer[read_offset..]),
@@ -317,40 +345,68 @@ impl<
 
             match result {
                 Either::First(WaitResult::Message(notification_json)) => {
-                    stream
-                        .write_all(&notification_json)
-                        .await
-                        .map_err(|_| RpcServerError::IoError)?;
-                    stream.flush().await.map_err(|_| RpcServerError::IoError)?;
+                    #[cfg(feature = "defmt")]
+                    debug!("Writing notification");
+
+                    with_timeout(
+                        Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
+                        stream.write_all(&notification_json),
+                    )
+                    .await
+                    .map_err(|_| RpcServerError::TimeoutError)?
+                    .map_err(|_| RpcServerError::IoError)?;
+
+                    with_timeout(
+                        Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
+                        stream.flush(),
+                    )
+                    .await
+                    .map_err(|_| RpcServerError::TimeoutError)?
+                    .map_err(|_| RpcServerError::IoError)?;
+
+                    #[cfg(feature = "defmt")]
+                    debug!("Notification sent to client");
+
                     continue;
                 }
                 Either::First(WaitResult::Lagged(x)) => {
                     #[cfg(feature = "defmt")]
-                    warn!("Dropped {:?} notifications", x);
+                    warn!("Dropped {} notifications due to lag", x);
                 }
-                Either::Second(Ok(0)) => return Ok(()),
+                Either::Second(Ok(0)) => {
+                    #[cfg(feature = "defmt")]
+                    debug!("Client disconnected");
+                    return Ok(());
+                }
                 Either::Second(Ok(n)) => {
-                    read_offset += n;
+                    #[cfg(feature = "defmt")]
+                    debug!("Received {} bytes from client", n);
 
-                    // Process complete frames from the buffer.
+                    read_offset += n;
                     while let Some(headers_len) =
                         Self::parse_headers(&request_buffer[..read_offset])
                     {
-                        let content_len: usize =
+                        let content_len =
                             Self::parse_content_length(&mut request_buffer[..headers_len])?;
                         let total_message_len = headers_len + content_len;
 
                         if read_offset < total_message_len {
-                            // Not enough data for a complete message; wait for more.
+                            #[cfg(feature = "defmt")]
+                            debug!("Incomplete message, waiting for more data");
                             break;
                         }
 
-                        // Process the complete JSON-RPC message.
-                        let request_json = &request_buffer[headers_len..headers_len + content_len];
-                        let response_json_len =
-                            self.handle_request(request_json, &mut response_json).await;
+                        #[cfg(feature = "defmt")]
+                        debug!("Received complete message, handling request");
 
-                        // Construct the response
+                        let request_json = &request_buffer[headers_len..headers_len + content_len];
+                        let response_json_len = self
+                            .handle_request(request_json, &mut response_json)
+                            .await?;
+
+                        #[cfg(feature = "defmt")]
+                        debug!("Sending response to client");
+
                         let mut headers: String<32> = String::new();
                         core::fmt::write(
                             &mut headers,
@@ -359,36 +415,70 @@ impl<
                         .unwrap();
 
                         if headers.len() + response_json_len > MAX_MESSAGE_LEN {
+                            #[cfg(feature = "defmt")]
+                            error!("Response message too large");
                             return Err(RpcServerError::BufferOverflow);
                         }
 
-                        // Write the headers and response to the stream
-                        stream
-                            .write_all(headers.as_bytes())
-                            .await
-                            .map_err(|_| RpcServerError::IoError)?;
-                        stream
-                            .write_all(&response_json[..response_json_len])
-                            .await
-                            .map_err(|_| RpcServerError::IoError)?;
-                        stream.flush().await.map_err(|_| RpcServerError::IoError)?;
+                        #[cfg(feature = "defmt")]
+                        debug!("Writing response");
 
-                        // Remove the processed message from the buffer.
+                        with_timeout(
+                            Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
+                            stream.write_all(headers.as_bytes()),
+                        )
+                        .await
+                        .map_err(|_| RpcServerError::TimeoutError)?
+                        .map_err(|_| RpcServerError::IoError)?;
+
+                        with_timeout(
+                            Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
+                            stream.write_all(&response_json[..response_json_len]),
+                        )
+                        .await
+                        .map_err(|_| RpcServerError::TimeoutError)?
+                        .map_err(|_| RpcServerError::IoError)?;
+
+                        with_timeout(
+                            Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
+                            stream.flush(),
+                        )
+                        .await
+                        .map_err(|_| RpcServerError::TimeoutError)?
+                        .map_err(|_| RpcServerError::IoError)?;
+
+                        #[cfg(feature = "defmt")]
+                        debug!("Response sent to client");
+
                         let remaining = read_offset - total_message_len;
                         request_buffer.copy_within(total_message_len..read_offset, 0);
                         read_offset = remaining;
                     }
                 }
-                Either::Second(Err(_)) => return Err(RpcServerError::IoError),
+                Either::Second(Err(_)) => {
+                    #[cfg(feature = "defmt")]
+                    error!("IO error during stream read");
+                    return Err(RpcServerError::IoError);
+                }
             }
         }
     }
 
     /// Handle a single JSON-RPC request
-    async fn handle_request(&self, request_json: &'a [u8], response_json: &'a mut [u8]) -> usize {
+    async fn handle_request(
+        &self,
+        request_json: &'a [u8],
+        response_json: &'a mut [u8],
+    ) -> Result<usize, RpcServerError> {
+        #[cfg(feature = "defmt")]
+        debug!("Handling request");
+
         let request: RpcRequestMetadata = match serde_json_core::from_slice(request_json) {
             Ok((request, _remainder)) => request,
             Err(_) => {
+                #[cfg(feature = "defmt")]
+                warn!("Failed to parse request JSON");
+
                 let response: RpcResponse<'_, ()> = RpcResponse {
                     jsonrpc: JSONRPC_VERSION,
                     error: Some(RpcError::from_code(RpcErrorCode::ParseError)),
@@ -396,13 +486,16 @@ impl<
                     result: None,
                 };
 
-                return serde_json_core::to_slice(&response, &mut response_json[..]).unwrap();
+                return Ok(serde_json_core::to_slice(&response, &mut response_json[..]).unwrap());
             }
         };
 
         let id = request.id;
 
         if request.jsonrpc != JSONRPC_VERSION {
+            #[cfg(feature = "defmt")]
+            warn!("Unsupported JSON-RPC version");
+
             let response: RpcResponse<'_, ()> = RpcResponse {
                 jsonrpc: JSONRPC_VERSION,
                 error: Some(RpcError::from_code(RpcErrorCode::InvalidRequest)),
@@ -410,16 +503,25 @@ impl<
                 id,
             };
 
-            return serde_json_core::to_slice(&response, &mut response_json[..]).unwrap();
+            return Ok(serde_json_core::to_slice(&response, &mut response_json[..]).unwrap());
         }
 
-        return match self.handlers.get(request.method) {
-            Some(handler) => match handler
-                .handle(id, request.method, request_json, response_json)
-                .await
+        #[cfg(feature = "defmt")]
+        debug!("Dispatching method: {}", request.method);
+
+        match self.handlers.get(request.method) {
+            Some(handler) => match with_timeout(
+                Duration::from_millis(DEFAULT_HANDLER_TIMEOUT_MS),
+                handler.handle(id, request.method, request_json, response_json),
+            )
+            .await
+            .map_err(|_| RpcServerError::TimeoutError)?
             {
-                Ok(response_len) => response_len,
+                Ok(response_len) => Ok(response_len),
                 Err(e) => {
+                    #[cfg(feature = "defmt")]
+                    error!("Handler returned error: {:?}", e);
+
                     let response: RpcResponse<'_, ()> = RpcResponse {
                         jsonrpc: JSONRPC_VERSION,
                         error: Some(e),
@@ -427,10 +529,13 @@ impl<
                         id,
                     };
 
-                    serde_json_core::to_slice(&response, &mut response_json[..]).unwrap()
+                    Ok(serde_json_core::to_slice(&response, &mut response_json[..]).unwrap())
                 }
             },
             None => {
+                #[cfg(feature = "defmt")]
+                warn!("Method not found: {}", request.method);
+
                 let response: RpcResponse<'_, ()> = RpcResponse {
                     jsonrpc: JSONRPC_VERSION,
                     error: Some(RpcError::from_code(RpcErrorCode::MethodNotFound)),
@@ -438,9 +543,9 @@ impl<
                     id,
                 };
 
-                serde_json_core::to_slice(&response, &mut response_json[..]).unwrap()
+                Ok(serde_json_core::to_slice(&response, &mut response_json[..]).unwrap())
             }
-        };
+        }
     }
 
     /// Parse the headers of the message, returning the index of the end of the headers.
