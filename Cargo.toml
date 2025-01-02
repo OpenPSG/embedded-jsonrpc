@@ -1,6 +1,6 @@
 [package]
 name = "embedded-jsonrpc"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "A JSON-RPC 2.0 server implementation for embedded systems."
@@ -20,8 +20,9 @@ critical-section = { version = "1.2.0", features = ["std"]}
 futures = "0.3"
 tokio = { version = "1.41.1", features = ["full"] }
 embassy-time = { version = "0.3.2", features = ["std", "generic-queue"] }
+defmt-logger-tcp = "0.2"
 
 [features]
 default = []
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "heapless/defmt-03"]
 embassy-time = ["dep:embassy-time"]

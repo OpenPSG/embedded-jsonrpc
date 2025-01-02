@@ -252,7 +252,7 @@ impl<'a, T, const STACK_SIZE: usize> StackFuture<'a, T, { STACK_SIZE }> {
     }
 }
 
-impl<'a, T, const STACK_SIZE: usize> Future for StackFuture<'a, T, { STACK_SIZE }> {
+impl<T, const STACK_SIZE: usize> Future for StackFuture<'_, T, { STACK_SIZE }> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -269,7 +269,7 @@ impl<'a, T, const STACK_SIZE: usize> Future for StackFuture<'a, T, { STACK_SIZE 
     }
 }
 
-impl<'a, T, const STACK_SIZE: usize> Drop for StackFuture<'a, T, { STACK_SIZE }> {
+impl<T, const STACK_SIZE: usize> Drop for StackFuture<'_, T, { STACK_SIZE }> {
     fn drop(&mut self) {
         (self.drop_fn)(self);
     }
